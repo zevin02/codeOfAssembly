@@ -17,20 +17,41 @@ _start:
     mov ah,0x03
     ; neg ah
     ; add al,ah
-    sub ah,al
-    ;add and sub all can deal with unsigned and signed
-    mov ax,0x0400
-    mov bl,0xf0
-    ;div只能处理有符号的除法 
-    ; div bl
-    ;同时还提供了一个idiv来处理无符号的除法
-    ; idiv bl
-    ; xor dx,dx
-    mov ax,0xf0c0
-    cwd
-    mov bx,0x11  ;处理的是16位的
-    idiv bx
-    
+    ; sub ah,al
+    ; ;add and sub all can deal with unsigned and signed
+    ; mov ax,0x0400
+    ; mov bl,0xf0
+    ; ;div只能处理有符号的除法 
+    ; ; div bl
+    ; ;同时还提供了一个idiv来处理无符号的除法
+    ; ; idiv bl
+    ; ; xor dx,dx
+    ; mov ax,0xf0c0
+    ; cwd
+    ; mov bx,0x11  ;处理的是16位的
+    ; idiv bx
+    cmp al,ah
+    jg lbb
+
+    lbb:
+        ;测试zf标志位,上一次的算术逻辑运算才会影响flag寄存器
+        sub ah,3
+        jz lbz
+        inc ah
+
+    lbz:
+        ;测试奇偶校验位
+        inc ah 
+        
+        jnp lbl 
+        dec ah 
+    lbl:
+        ;测试进位
+        mov bl,0xf4
+        add bl,0x11
+        jc lbz
+        inc bl 
+
 
 
 
