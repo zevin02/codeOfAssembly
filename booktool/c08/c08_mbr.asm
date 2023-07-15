@@ -106,7 +106,7 @@ SECTION mbr align=16 vstart=0x7c00
          mov ax,[bx]
          call calc_segment_base
          mov [bx],ax                     ;回填段的基址
-         add bx,4                        ;下一个重定位项（每项占4个字节） 
+         add bx,4                        ;下一个重定位项（每项占4个字节） direct
          loop realloc 
       
          jmp far [0x04]                  ;转移到用户程序  
@@ -166,7 +166,7 @@ read_hard_disk_0:                        ;从硬盘读取一个逻辑扇区
       
       ;5.连续取出数据,0x1f0是硬盘的数据端口，还是一个16位端口,一旦硬盘控制器空闲，准备就绪，就可以连续从这个端口写入或者读取数据
       ;从磁盘中读取一个扇区
-         mov cx,256                      ;总共要读取的字数
+         mov cx,256                      ;总共要循环的次数，每次读取1个字，循环256次，就可以读取512字节，一个扇区的大小
          mov dx,0x1f0               ;读取的数据存放在ds中
          
   .readw:
