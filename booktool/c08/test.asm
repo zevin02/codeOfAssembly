@@ -42,8 +42,12 @@ _start:
 
     ;四：等待
     
-    mov ah, 0x0f 
-    shr ah,5
+    ; mov ah, 0x0f 
+    ; shr ah,5
+    xor dx,dx
+    mov ax,0x1fff 
+    mov bx, 0x2f11 
+    mul bx
     
 
     ; 退出程序
