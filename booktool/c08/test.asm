@@ -46,9 +46,9 @@ _start:
     ; shr ah,5
     xor dx,dx
     mov ax,0x1fff 
+    sti
     mov bx, 0x2f11 
     mul bx
-    
 
     ; 退出程序
     mov eax, 1       ; 系统调用号1表示exit
