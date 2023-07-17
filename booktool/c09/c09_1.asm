@@ -26,7 +26,9 @@ header_end:
 ;===============================================================================
 ;程序入口的段地址
 SECTION code align=16 vstart=0           ;定义代码段（16字节对齐） 
+;中断处理程序
 new_int_0x70:
+        ;先保护现场，将后面需要使用的寄存器压栈保存
       push ax
       push bx
       push cx
@@ -34,20 +36,32 @@ new_int_0x70:
       push es
       
   .w0:                                    
-      mov al,0x0a                        ;阻断NMI。当然，通常是不必要的
-      or al,0x80                          
-      out 0x70,al
-      in al,0x71                         ;读寄存器A
+      mov al,0x0a                        ;阻断NMI。当然，通常是不必要的，指定RTC的寄存器a
+      or al,0x80                          ;将高位设置成1,来阻断NMI
+      out 0x70,al                         ;写入0x70端口
+
+      in al,0x71                         ;读寄存器A，从0x71数据端口中读取寄存器a的数据
+      
+      ;测试最高位的第7位UIP位，根据UIP位来决定是等待更新周期结束，还是继续往下执行
+      ;UIP=0表示现在读取CMOS -RAM中的数据是安全的
+      
+      ;test指令和and指令是一样的，不过test指令会把结果舍弃，不会保存再al中，
       test al,0x80                       ;测试第7位UIP 
+      ;如果zf=0,说明UIP是1,说明仍然处于更新周期,就需要继续返回进行循环等待更新结束
+
       jnz .w0                            ;以上代码对于更新周期结束中断来说 
                                          ;是不必要的 
-      xor al,al
-      or al,0x80
-      out 0x70,al
-      in al,0x71                         ;读RTC当前时间(秒)
-      push ax
 
-      mov al,2
+        ;走到这里说明zf=1,说明UIP标志位是0，现在就是可以安全的读取其中的数据了
+
+        ;分别访问CMOS-RAM的0,2,4号单元,读取当前的时分秒
+      xor al,al         ;指定0x00偏移地址，秒
+      or al,0x80        ;加上nmi标志
+      out 0x70,al       ;写入0x70端口，指定秒
+      in al,0x71                         ;读RTC当前时间(秒),读取s数据
+      push ax   ;把ax压栈，中断完成后，外部程序能够得到这个数据
+
+      mov al,2  ;指定0x02偏移量,指定分
       or al,0x80
       out 0x70,al
       in al,0x71                         ;读RTC当前时间(分)
@@ -59,23 +73,32 @@ new_int_0x70:
       in al,0x71                         ;读RTC当前时间(时)
       push ax
 
+
+
       mov al,0x0c                        ;寄存器C的索引。且开放NMI 
       out 0x70,al
+      ;读取寄存器C标志位，让之后可以处理下一次中断
       in al,0x71                         ;读一下RTC的寄存器C，否则只发生一次中断
+
                                          ;此处不考虑闹钟和周期性中断的情况 
+
       mov ax,0xb800
-      mov es,ax
+      mov es,ax ;将段寄存器es指向显示缓冲区
 
-      pop ax
-      call bcd_to_ascii
+        ;现在就可以再屏幕上显示时间信息了
+        
+      pop ax            ;//显示时信息
+      call bcd_to_ascii ;将BCD编码表示的小时转化成ascill码
       mov bx,12*160 + 36*2               ;从屏幕上的12行36列开始显示
+        ;ax的低8位是个位，高8位是十位
 
-      mov [es:bx],ah
-      mov [es:bx+2],al                   ;显示两位小时数字
+      mov [es:bx],ah    ;打印10位
+      mov [es:bx+2],al                   ;显示两位小时数字，打印个位
 
       mov al,':'
       mov [es:bx+4],al                   ;显示分隔符':'
-      not byte [es:bx+5]                 ;反转显示属性 
+      ;因为每次都是操纵一个位置，所以将显示属性转都是相同内存的位置
+      not byte [es:bx+5]                 ;反转显示属性 ;为了验证RTC更新结束后的中断是每秒出现一次，not反转一下冒号的显示属性
 
       pop ax
       call bcd_to_ascii
@@ -91,8 +114,11 @@ new_int_0x70:
       mov [es:bx+12],ah
       mov [es:bx+14],al                  ;显示两位小时数字
       
+      ;8259芯片中由中断服务寄存器ISR,每个位对应一个中断输入引脚，中断处理程序开始的时候，就会将相应的位设置成1
+
+      ;中断程序结束需要发送中断结束命令0x20，EOI
       mov al,0x20                        ;中断结束命令EOI 
-      out 0xa0,al                        ;向从片发送 
+      out 0xa0,al                        ;向从片发送 分别向两个8259芯片发送中断结束
       out 0x20,al                        ;向主片发送 
 
       pop es
@@ -101,19 +127,21 @@ new_int_0x70:
       pop bx
       pop ax
 
-      iret
+      iret;使用中断返回指令进行返回到之前的地方执行
 
 ;-------------------------------------------------------------------------------
+;al的低4位表示个位，al的高4位表示十位
 bcd_to_ascii:                            ;BCD码转ASCII
                                          ;输入：AL=bcd码
                                          ;输出：AX=ascii
-      mov ah,al                          ;分拆成两个数字 
-      and al,0x0f                        ;仅保留低4位 
-      add al,0x30                        ;转换成ASCII 
 
-      shr ah,4                           ;逻辑右移4位 
+      mov ah,al                          ;分拆成两个数字 将al赋值给ah
+      and al,0x0f                        ;仅保留低4位 保留al的低4位
+      add al,0x30                        ;转换成ASCII 加上之后就可以了
+
+      shr ah,4                           ;逻辑右移4位 ，获得高4位
       and ah,0x0f                        
-      add ah,0x30
+      add ah,0x30                               ;转化成ascill值
 
       ret
 
@@ -201,12 +229,17 @@ start:
       mov bx,tips_msg                    ;显示提示信息
       call put_string
       
+
       mov cx,0xb800
       mov ds,cx
-      mov byte [12*160 + 33*2],'@'       ;屏幕第12行，35列
-       
+      mov byte [12*160 + 33*2],'@'       ;屏幕第12行，33列，显示出来@
+       ;此后程序就没有事情可以再做了
  .idle:
+        ;hlt指令可以使得处理器停止执行指令，并处于停机状态，者可以降低处理器的功耗，处于停机状态的处理器可以被外部中断唤醒并恢复执行
+        ;并继续执行hlt后面的程序
+        ;主程序就是这样，停机，执行，接着停机
       hlt                                ;使CPU进入低功耗状态，直到用中断唤醒
+
       not byte [12*160 + 33*2+1]         ;反转显示属性 
       jmp .idle
 
