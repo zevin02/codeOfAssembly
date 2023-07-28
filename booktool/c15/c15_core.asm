@@ -355,23 +355,29 @@ terminate_current_task:                     ;终止当前任务
                                             ;注意，执行此例程时，当前任务仍在
                                             ;运行中。此例程其实也是当前任务的
                                             ;一部分 
-         pushfd
+       ;用户通过调用门进入到任务的全局空间
+       ;该过程结束当前任务的执行，并转化到其他任务
+       ;我们现在需要切换到程序管理器任务
+         pushfd      ;将eflags进行压栈
          mov edx,[esp]                      ;获得EFLAGS寄存器内容
          add esp,4                          ;恢复堆栈指针
 
+       ;
          mov eax,core_data_seg_sel
          mov ds,eax
 
          test dx,0100_0000_0000_0000B       ;测试NT位
+         ;测试NT位看是0还是1来决定采用那种方式（iret，call）回到程序管理器任务
          jnz .b1                            ;当前任务是嵌套的，到.b1执行iretd 
          mov ebx,core_msg1                  ;当前任务不是嵌套的，直接切换到 
          call sys_routine_seg_sel:put_string
-         jmp far [prgman_tss]               ;程序管理器任务 
+         jmp far [prgman_tss]               ;程序管理器任务 ，jmp发起所以就需要使用jmp结束回到程序管理器中
        
   .b1: 
+       ;由于当前是嵌套的，所以使用iret返回，因为是使用call指令导致的中断
          mov ebx,core_msg0
          call sys_routine_seg_sel:put_string
-         iretd
+         iretd       ;32位下就是使用iretd类似16位的iret
       
 sys_routine_end:
 
@@ -686,7 +692,7 @@ load_relocate_program:                      ;加载并重定位用户程序
          mov ecx,4096
          mov eax,ecx                        ;为生成堆栈高端地址做准备
          mov [es:esi+0x28],ecx
-         shr [es:esi+0x28],12               ;登记1特权级堆栈尺寸到TCB
+         shr dword  [es:esi+0x28],12               ;登记1特权级堆栈尺寸到TCB
          call sys_routine_seg_sel:allocate_memory
          add eax,ecx                        ;堆栈必须使用高端地址为基地址
          mov [es:esi+0x2c],eax              ;登记1特权级堆栈基地址到TCB
@@ -703,7 +709,7 @@ load_relocate_program:                      ;加载并重定位用户程序
          mov ecx,4096
          mov eax,ecx                        ;为生成堆栈高端地址做准备
          mov [es:esi+0x36],ecx
-         shr [es:esi+0x36],12               ;登记2特权级堆栈尺寸到TCB
+         shr dword  [es:esi+0x36],12               ;登记2特权级堆栈尺寸到TCB
          call sys_routine_seg_sel:allocate_memory
          add eax,ecx                        ;堆栈必须使用高端地址为基地址
          mov [es:esi+0x3a],ecx              ;登记2特权级堆栈基地址到TCB
@@ -725,6 +731,7 @@ load_relocate_program:                      ;加载并重定位用户程序
          mov [es:esi+0x10],cx               ;登记LDT选择子到TCB中
        
          ;创建用户程序的TSS
+         ;对当前用户程序的TSS填写就比较完整了，
          mov ecx,104                        ;tss的基本尺寸
          mov [es:esi+0x12],cx              
          dec word [es:esi+0x12]             ;登记TSS界限值到TCB 
@@ -732,7 +739,7 @@ load_relocate_program:                      ;加载并重定位用户程序
          mov [es:esi+0x14],ecx              ;登记TSS基地址到TCB
       
          ;登记基本的TSS表格内容
-         mov word [es:ecx+0],0              ;反向链=0
+         mov word [es:ecx+0],0              ;反向链=0,还没有被从一个任务切换到该任务
       
          mov edx,[es:esi+0x24]              ;登记0特权级堆栈初始ESP
          mov [es:ecx+4],edx                 ;到TSS中
@@ -764,7 +771,7 @@ load_relocate_program:                      ;加载并重定位用户程序
       
          ;访问用户程序头部，获取数据填充TSS 
          mov ebx,[ebp+11*4]                 ;从堆栈中取得TCB的基地址
-         mov edi,[es:ebx+0x06]              ;用户程序加载的基地址 
+         mov edi,[es:ebx+0x06]              ;用户程序加载的基地址 ，使用4G的es获得用户程序的基地址，就是用户程序头部的起始地址
 
          mov edx,[es:edi+0x10]              ;登记程序入口点（EIP） 
          mov [es:ecx+32],edx                ;到TSS
@@ -784,10 +791,10 @@ load_relocate_program:                      ;加载并重定位用户程序
 
          mov word [es:ecx+92],0             ;TSS中的GS=0
 
-         pushfd
-         pop edx
+         pushfd      ;将标志寄存器压栈eflags
+         pop edx     ;将eflags的数据保存在edx中
          
-         mov dword [es:ecx+36],edx          ;EFLAGS
+         mov dword [es:ecx+36],edx          ;EFLAGS，将当前的eflags寄存器保存在当前任务的TSS中
 
          ;在GDT中登记TSS描述符
          mov eax,[es:esi+0x14]              ;TSS的起始线性地址
@@ -905,16 +912,23 @@ start:
          mov ebx,message_2
          call far [salt_1+256]              ;通过门显示信息(偏移量将被忽略) 
       
+       ;上面的就是显示处理器品牌信息，以及安装给每个任务使用的调用门
+       ;现在需要创建0特权级的内核任务，并且将当前正在执行的内核代码段归到这个任务，当前代码的作用就是创建其他任务，管理他们
+       ;叫做任务管理器（程序管理器）
+
          ;为程序管理器的TSS分配内存空间 
          mov ecx,104                        ;为该任务的TSS分配内存
          call sys_routine_seg_sel:allocate_memory
-         mov [prgman_tss+0x00],ecx          ;保存程序管理器的TSS基地址 
-      
-         ;在程序管理器的TSS中设置必要的项目 
-         mov word [es:ecx+96],0             ;没有LDT。处理器允许没有LDT的任务。
-         mov word [es:ecx+102],103          ;没有I/O位图。0特权级事实上不需要。
-         mov word [es:ecx+0],0              ;反向链=0
-         mov dword [es:ecx+28],0            ;登记CR3(PDBR)
+         mov [prgman_tss+0x00],ecx          ;保存程序管理器的TSS基地址,6个字节，前6个字节存储他的起始地址，后6个字节存储他的段选择子 
+       ;创建TSS需要的内存空间,ecx中就是起始的地址
+       ;为内核任务创建TSS（任务状态段是一个任务存在的标志，有了这个才能进行任务切换,在任务切换时候需要进行保存任务数据,把数据保存在这个里面）
+
+         ;在程序管理器的TSS中设置必要的项目 es指向的是0-4G的内存空间
+         ;由于程序管理器任务是运行在0特权级上的，所以不需要创建1,2,3特权的栈，除了从调用门返回之外无法从高特权进入低特权任务
+         mov word [es:ecx+96],0             ;没有LDT。处理器允许没有LDT的任务。由于是程序管理器，所以没有LDT，所以LDT的段选择子是0,可以装在GDT中
+         mov word [es:ecx+102],103          ;没有I/O位图。0特权级事实上不需要。103代表地址相对0的地址，所以也没有IO位图
+         mov word [es:ecx+0],0              ;反向链=0,由于是第一个任务，所以没有前一个任务的描述符选择子,如果发生切换的话，这个就会记录切换到这个任务的TSS描述符选择子
+         mov dword [es:ecx+28],0            ;登记CR3(PDBR)由于现在没有使用分页技术，所以也没有使用CR3寄存器
          mov word [es:ecx+100],0            ;T=0
                                             ;不需要0、1、2特权级堆栈。0特级不
                                             ;会向低特权级转移控制。
@@ -922,28 +936,55 @@ start:
          ;创建TSS描述符，并安装到GDT中 
          mov eax,ecx                        ;TSS的起始线性地址
          mov ebx,103                        ;段长度（界限）
+
+         ;这里由于是TSS描述符，所以type=10（0）1，第3位是B位表示是否busy，任务执行的时候，这个位就会被设置成1表示正在执行
+         
          mov ecx,0x00408900                 ;TSS描述符，特权级0
          call sys_routine_seg_sel:make_seg_descriptor
-         call sys_routine_seg_sel:set_up_gdt_descriptor
-         mov [prgman_tss+0x04],cx           ;保存程序管理器的TSS描述符选择子 
+         call sys_routine_seg_sel:set_up_gdt_descriptor        ;将构造的TSS的段选择子是存在在GDT中的，并且使它生效
+         mov [prgman_tss+0x04],cx           ;保存程序管理器的TSS描述符选择子 ,段选择子填写到相应的位置
 
          ;任务寄存器TR中的内容是任务存在的标志，该内容也决定了当前任务是谁。
          ;下面的指令为当前正在执行的0特权级任务“程序管理器”后补手续（TSS）。
-         ltr cx                              
+         ;执行这个指令之后，处理器用该段选择子访问GDT，并且找到相应的TSS描述符，将其中的B位设置成1,表示这个任务正在执行
+         ;同时还要将该描述符传送到TR寄存器的高速缓冲区中
+         ltr cx                                    
 
          ;现在可认为“程序管理器”任务正执行中
          mov ebx,prgman_msg1
          call sys_routine_seg_sel:put_string
 
+         ;创建完TSS之后，打印了一条消息
+
+         ;任务切换的方法
+         ;1.中断：这个就是现代抢占式多任务的基础（中断没有被屏蔽，就能随时发生），由其是定时器中断（按照准确的时间间隔发生，可以进行强制实施任务切换）
+         ;在保护模式之下，就不再使用中断向量表（使用中断描述符表格），中断描述符表用来保存门描述符（任务门，陷阱门，中断门）
+         ;对于一个中断，处理器用中断号*8（一个门描述符8字节）访问表格得到门描述符(门描述符中有代码段选择子和段内偏移量)
+
+       ;发起任务切换
+       ;中断发生的时候，处理器使用中断号*8访问中断描述符表，如果知道这个描述符是任务门的时候，就要发生任务的切换了
+       ;从中断描述符表中获得任务门描述符，得到TSS选择子，通过TSS选择子访问GDT，获得新任务的TSS描述符
+       ;将当前任务的所有寄存器保存在在TSS中，处理器访问新任务的TSS，恢复所有寄存器的内容
+       ;将TR指向这个TSS中，将TSS描述符中的B位设置成1,表示这个任务在工作
+
+       ;任务返回
+       ;1.iret指令回到前任务，检查EFLAGS的NT=1表示这个是嵌套任务,需要返回原本被中断的任务继续执行
+       ;2.此时处理器固件将EFLAGS的NT设置0,将现在的TSS的B位设置成0（不忙），保存当前任务之后
+       ;用新任务的TSS恢复现场(老的任务会写入到新任务的连接域中，进行获得TSS描述符返回)
+
+       ;加载用户程序
          mov ecx,0x46
-         call sys_routine_seg_sel:allocate_memory
+         call sys_routine_seg_sel:allocate_memory       ;分配一个TCB
          call append_to_tcb_link            ;将此TCB添加到TCB链中 
       
          push dword 50                      ;用户程序位于逻辑50扇区
          push ecx                           ;压入任务控制块起始线性地址 
        
-         call load_relocate_program         
+         call load_relocate_program             ;加载用户程序
       
+      ;加载程序完成，进行一个间接远调用，指向的是TCB的0x14地址
+      ;处理器获得任务的TSS基地址，然后是TSS的段选择子，就会进行任务切换，32位偏移部分无用
+      ;进行任务切换的时候，发现是一个TSS描述符，就需要进行切换，
          call far [es:ecx+0x14]             ;执行任务切换。和上一章不同，任务切
                                             ;换时要恢复TSS内容，所以在创建任务
                                             ;时TSS要填写完整 
@@ -955,14 +996,15 @@ start:
          mov ecx,0x46
          call sys_routine_seg_sel:allocate_memory
          call append_to_tcb_link            ;将此TCB添加到TCB链中
-
+       ;仍然是50号，所以一个程序可以对应多个任务，在内存中的不同位置，彼此之间没有关系
          push dword 50                      ;用户程序位于逻辑50扇区
          push ecx                           ;压入任务控制块起始线性地址
 
          call load_relocate_program
 
+       ;现在是使用jmp指令来进行的任务切换，新任务不会被嵌套在旧的任务中，该tss的b位被清零
          jmp far [es:ecx+0x14]              ;执行任务切换
-
+       ;切换回来
          mov ebx,prgman_msg3
          call sys_routine_seg_sel:put_string
 

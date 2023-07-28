@@ -59,19 +59,21 @@ start:
      
          mov eax,[data_seg]
          mov ds,eax
-     
+        ;下面的两个call都是通过调用门来进行特权的切换
          mov ebx,message_1
          call far [fs:PrintString]
          
-         mov ax,cs
+         ;计算当前特权级别，CPL
+         mov ax,cs      ;从当前cs中的RPL字段中获得RPL，就是当前代码段的CPL
          and al,0000_0011B
          or al,0x0030
          mov [message_2],al
          
          mov ebx,message_2
-         call far [fs:PrintString]
-     
-         call far [fs:TerminateProgram]      ;退出，并将控制权返回到核心 
+         call far [fs:PrintString]  ;打印
+        ;我们现在在
+
+         call far [fs:TerminateProgram]      ;退出，并将控制权返回到核心，调用回到内核空间 
     
 code_end:
 
