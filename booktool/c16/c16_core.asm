@@ -358,6 +358,7 @@ allocate_a_4k_page:                         ;分配一个4KB的页
 alloc_inst_a_page:                          ;分配一个页，并安装在当前活动的
                                             ;层级分页结构中
                                             ;输入：EBX=页的线性地址
+       ;这个的任务就是在可用的物理内存中搜索空闲的页，然后进行页表的安装
          push eax
          push ebx
          push esi
@@ -368,8 +369,9 @@ alloc_inst_a_page:                          ;分配一个页，并安装在当�
          
          ;检查该线性地址所对应的页表是否存在
          mov esi,ebx
-         and esi,0xffc00000
-         shr esi,20                         ;得到页目录索引，并乘以4 
+         and esi,0xffc00000        ;提取高10位
+         shr esi,20                         ;得到页目录索引，并乘以4 ，这个时候esi就是页目录的偏移地址
+         ;页目录表的线性地址时0xfffff000
          or esi,0xfffff000                  ;页目录自身的线性地址+表内偏移 
 
          test dword [esi],0x00000001        ;P位是否为“1”。检查该线性地址是 
@@ -526,6 +528,8 @@ SECTION core_data vstart=0                  ;系统核心的数据段
          tcb_chain        dd  0
 
          ;内核信息
+         ;为了能够连续，动态的分配内核的空间，内核需要记住下一个可以用来分配的线性地址，
+         ;在分页机制下，内存的分配既需要在虚拟内存空间中进行，页需要在页目录和页表中进行，
          core_next_laddr  dd  0x80100000    ;内核空间中下一个可分配的线性地址        
          program_man_tss  dd  0             ;程序管理器的TSS描述符选择子 
                           dw  0
@@ -920,6 +924,14 @@ start:
          mov ebx,cpu_brnd1
          call sys_routine_seg_sel:put_string
 
+
+         ;打赢完信息之后就开启页功能
+         ;每个任务都有自己的页表和页目录，所以内核同样也是有页表和页目录
+         ;在一个理想的分页系统中，要加载程序，必须先搜索可以使用的页，并将他和自己虚拟内存空间的地址对应起来,这样段部件输出的值和页部件输出的值不同
+         ;但是内核是在开启分页功能前加载的，段在内存中的位置都已经固定下来了，这样即使开启页功能
+         ;虚拟地址要和物理地址相同，使得低端1mb内存经过页转化之后和物理地址相同即可，这样内核就可以不做什么改动即可在分页机制下工作
+         ;内核使用1个页目录和1个页表就够了4mb内存
+
          ;准备打开分页机制
          
          ;创建系统内核的页目录表PDT
@@ -928,75 +940,94 @@ start:
          mov ebx,0x00020000                 ;页目录的物理地址
          xor esi,esi
   .b1:
-         mov dword [es:ebx+esi],0x00000000  ;页目录表项清零 
+         mov dword [es:ebx+esi],0x00000000  ;页目录表项清零 ，主要是让P=0,表示这个页表不存在内存，在地址转化的时候触发中断
          add esi,4
          loop .b1
          
+         ;建立了一个空的页目录
+
          ;在页目录内创建指向页目录自己的目录项
-         mov dword [es:ebx+4092],0x00020003 
+         ;20003的前20位是物理地址的高20位，P=1,页是存在内存里面，RW=1，该页表可读可写，US=0表示这个页表不允许特权级3的访问
+         
+         mov dword [es:ebx+4092],0x00020003 ;将页目录表的物理地址等级在最后一个目录项中
 
          ;在页目录内创建与线性地址0x00000000对应的目录项
-         mov dword [es:ebx+0],0x00021003    ;写入目录项（页表的物理地址和属性）      
+         mov dword [es:ebx+0],0x00021003    ;写入目录项（页表的物理地址和属性）  第一个目录项写入对应的页表地址    
 
          ;创建与上面那个目录项相对应的页表，初始化页表项 
+         ;只初始化256个页表项，将1mb的页包含的物理地址一个一个写入到页表中
          mov ebx,0x00021000                 ;页表的物理地址
-         xor eax,eax                        ;起始页的物理地址 
-         xor esi,esi
+         xor eax,eax                        ;起始页的物理地址 ，每次按照0x1000增加，因为对应的是0x00000开始的物理地址
+         xor esi,esi               ;用来定位每个页表项目
+         
   .b2:       
-         mov edx,eax
+         mov edx,eax        ;先将页的物理地址写入到edx中
          or edx,0x00000003                                                      
-         mov [es:ebx+esi*4],edx             ;登记页的物理地址
+         mov [es:ebx+esi*4],edx             ;登记页的物理地址，写入到页表中
          add eax,0x1000                     ;下一个相邻页的物理地址 
          inc esi
          cmp esi,256                        ;仅低端1MB内存对应的页才是有效的 
          jl .b2
          
+       ;该页表只有1mb内存对应的页有效，其余的页都是无效的，所以我们需要设置成为成无效
   .b3:                                      ;其余的页表项置为无效
          mov dword [es:ebx+esi*4],0x00000000  
          inc esi
          cmp esi,1024
          jl .b3 
 
-         ;令CR3寄存器指向页目录，并正式开启页功能 
-         mov eax,0x00020000                 ;PCD=PWT=0
-         mov cr3,eax
 
-         mov eax,cr0
-         or eax,0x80000000
-         mov cr0,eax                        ;开启分页机制
+         ;令CR3寄存器指向页目录，并正式开启页功能 
+         mov eax,0x00020000                 ;PCD=PWT=0,
+         mov cr3,eax        ;CR3寄存器指向页的目录，这样就开启了页功能
+
+         mov eax,cr0        ;读取cr0
+         or eax,0x80000000  ;cr0的最高位是PG表示是否开启页功能，PG=1就开启
+         mov cr0,eax                        ;开启分页机制，只有在保护模式之下才能够进行开启页功能
 
          ;在页目录内创建与线性地址0x80000000对应的目录项
+         ;全局地址空间占据这任务4GB空间的高2GB，对应的是0x80000000-0xffffffff,所以我们需要修改内核自己的目录表，甚至是各个段的描述符
+         ;将内核移动到虚拟地址的高处，
          mov ebx,0xfffff000                 ;页目录自己的线性地址 
          mov esi,0x80000000                 ;映射的起始地址
          shr esi,22                         ;线性地址的高10位是目录索引
          shl esi,2
+         ;esi内容为0x200
+         ;[]中的现在都是虚拟（线性）地址,该段部件发出的线性地址为0xfffff200
+         ;只有高20位有效，后面12位是物理地址中的偏移地址,前10位0x3ff*4=0xffc+cr3的地址得到对应的页目录项
+         ;在页目录项中得到32位地址，为0xfffff200对应页表的物理地址
+         ;由于前面操作的ffc位置的填写的是自己的基础地址，把页目录当作页表使用
+         ;所以线性地址高20位是0xfffff 时访问的都是页目录自己
+         
          mov dword [es:ebx+esi],0x00021003  ;写入目录项（页表的物理地址和属性）
                                             ;目标单元的线性地址为0xFFFFF200
                                              
          ;将GDT中的段描述符映射到线性地址0x80000000
+         
          sgdt [pgdt]
          
-         mov ebx,[pgdt+2]
-         
+         mov ebx,[pgdt+2]   ;
+         ;将所有的描述符的高字部分都设置成1即可
          or dword [es:ebx+0x10+4],0x80000000
          or dword [es:ebx+0x18+4],0x80000000
          or dword [es:ebx+0x20+4],0x80000000
          or dword [es:ebx+0x28+4],0x80000000
          or dword [es:ebx+0x30+4],0x80000000
          or dword [es:ebx+0x38+4],0x80000000
-         
+         ;将GDT的基础地址映射到内存的高段，
          add dword [pgdt+2],0x80000000      ;GDTR也用的是线性地址 
-         
+         ;开启分页之后GDT使用的也都是虚拟地址
          lgdt [pgdt]
         
          jmp core_code_seg_sel:flush        ;刷新段寄存器CS，启用高端线性地址 
                                              
    flush:
+       ;现在cs和ds都是指向0x8000000开始的虚拟地址空间
          mov eax,core_stack_seg_sel
-         mov ss,eax
+         mov ss,eax  ;重新加载ss
          
          mov eax,core_data_seg_sel
-         mov ds,eax
+         mov ds,eax  ;重新加载ds，更新描述符高速缓存器
           
          mov ebx,message_1
          call sys_routine_seg_sel:put_string
@@ -1022,9 +1053,12 @@ start:
          mov ebx,message_2
          call far [salt_1+256]              ;通过门显示信息(偏移量将被忽略) 
       
+       ;现在这些调用门的选择子都被映射到内存的高端了
+       ;接下来就是使内核的一部分成为任务，并且为创建用户任务和实施任务切换做准备
+       
          ;为程序管理器的TSS分配内存空间
-         mov ebx,[core_next_laddr]
-         call sys_routine_seg_sel:alloc_inst_a_page
+         mov ebx,[core_next_laddr]        ;获得可用的线性地址，用作TSS的起始线性地址
+         call sys_routine_seg_sel:alloc_inst_a_page     ;使用ebx来做为一个参数来申请物理页
          add dword [core_next_laddr],4096
 
          ;在程序管理器的TSS中设置必要的项目 
