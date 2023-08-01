@@ -9,10 +9,12 @@
          idt_linear_address     equ  0x8001f000  ;中断描述符表的线性基地址 
 ;-------------------------------------------------------------------------------          
          ;以下定义宏
+         ;宏是预处理指令，
+         ;这个具有0个参数，这个宏的作用就是在内核的虚拟地址空间上分配内存，返回起始的线性地址,下一个可分配的线性任务在内核TCB中
          %macro alloc_core_linear 0              ;在内核空间中分配虚拟内存 
-               mov ebx,[core_tcb+0x06]
-               add dword [core_tcb+0x06],0x1000
-               call flat_4gb_code_seg_sel:alloc_inst_a_page
+               mov ebx,[core_tcb+0x06]           ;下一个可分配的线性地址在内核的TCB中，所以从中获得该地址       
+               add dword [core_tcb+0x06],0x1000  ;每次内核空间分配内存不管分配多少，都固定的分配一个页，增加1页
+               call flat_4gb_code_seg_sel:alloc_inst_a_page    ;分配物理页
          %endmacro 
 ;-------------------------------------------------------------------------------
          %macro alloc_user_linear 0              ;在任务空间中分配虚拟内存 
@@ -23,11 +25,14 @@
          
 ;===============================================================================
 SECTION  core  vstart=0x80040000
+       ;这个地方使用的一开始就是虚拟地址
+       ;内核有自己独立的2GB 内存空间，而要要映射到任务的高2G空间，从0x80000000开始
+       ;一旦知道了内核运行的虚拟地址，内核代码在编译的时候，start的虚拟地址也要相同，内核才能正常运行(经过页部件转化之后，在内存中还是0x40000)
 
          ;以下是系统核心的头部，用于加载核心程序 
          core_length      dd core_end       ;核心程序总长度#00
 
-         core_entry       dd start          ;核心代码段入口点#04
+         core_entry       dd start          ;核心代码段入口点#04      ;访问这个，直接进行跳转到相应的位置中
 
 ;-------------------------------------------------------------------------------
          [bits 32]
@@ -389,8 +394,13 @@ create_copy_cur_pdir:                       ;创建新页目录，并复制当�
          call allocate_a_4k_page            
          mov ebx,eax
          or ebx,0x00000007
-         mov [0xfffffff8],ebx
+         mov [0xfffffff8],ebx      ;往页目录页的倒数第二个条目中写入新任务的页目录页的地址
 
+         
+       ;invalidate TLB entry,和刷新整个TLB 不同，这个指令只是刷新TLB 的一个条目
+       ;必须指定一个线性地址，处理器用给出的线性地址搜索TLB，并找到那个条目然后从内存中重新加载
+       ;这个位置指向的是页目录的倒数第2项，我们每次都把这个项目用来指向新任务的页目录项，所以这个条目要刷新
+         ;即使上面我们修改好了，但是还没有反映到TLB中，所以这里要显示的刷新条目数据
          invlpg [0xfffffff8]
 
          mov esi,0xfffff000                 ;ESI->当前页目录的线性地址
@@ -409,19 +419,24 @@ create_copy_cur_pdir:                       ;创建新页目录，并复制当�
 ;-------------------------------------------------------------------------------
 general_interrupt_handler:                  ;通用的中断处理过程
          push eax
-          
+          ;向8259A芯片发送中断结束命令EOI
          mov al,0x20                        ;中断结束命令EOI 
          out 0xa0,al                        ;向从片发送 
          out 0x20,al                        ;向主片发送
          
          pop eax
           
-         iretd
+         iretd       ;直接就返回
 
 ;-------------------------------------------------------------------------------
 general_exception_handler:                  ;通用的异常处理过程
-         mov ebx,excep_msg
-         call flat_4gb_code_seg_sel:put_string
+
+       ;对异常处理，如page fault处理完了就继续使用，但是有的异常发生后就无法恢复执行，使用iretd指令来返回
+       ;有的异常会有错误代码进行压栈，有的没有，如果有的话，在异常处理程序中就需要弹出错误代码（包含出现异常时的当前段选择子）
+
+         mov ebx,excep_msg  
+         ;这个使用的是远调用
+         call flat_4gb_code_seg_sel:put_string   ;打印消息后停机，调用这个过程还需要包装成调用门，方便用户使用
          
          hlt
 
@@ -429,8 +444,13 @@ general_exception_handler:                  ;通用的异常处理过程
 rtm_0x70_interrupt_handle:                  ;实时时钟中断处理过程
 
          pushad
+       ;计算机的主板上有RTC定时长生更新周期结束和中断信号，可以设置RTC芯片，使得他每次更新CMOS时间的时候，都能发出中断信号
+       ;RTC时0x70中断向量
+
 
          mov al,0x20                        ;中断结束命令EOI
+         ;8259A的主片和从片都要发送中断命令EOI，否则他不会向处理器发送另一个中断通知
+         ;0xa0是主片的端口，0x20是从片的端口，可以通过这些端口设置他的工作状态和IMR的内容
          out 0xa0,al                        ;向8259A从片发送
          out 0x20,al                        ;向8259A主片发送
 
@@ -438,6 +458,19 @@ rtm_0x70_interrupt_handle:                  ;实时时钟中断处理过程
          out 0x70,al
          in al,0x71                         ;读一下RTC的寄存器C，否则只发生一次中断
                                             ;此处不考虑闹钟和周期性中断的情况
+       
+         ;在多任务的系统中有很多系统需要处理，使用TCB来串连，
+         ;在中断中实施任务切换，可以使用jmp指令，从当前正在运行的任务切换到空闲任务（中断必然是在某个任务中发生的）
+
+         ;中断处理过程的主要功能是确定下一个要被执行的任务，并切换到那个任务中
+         ;1.遍历TCB找到当前任务（状态是0XFFFF），找不到的话，就直接iretd中断返回
+         ;2.如果找到了，将这个节点移动到链表的尾节点，调度的优先级最低
+         ;3.再遍历TCB链，寻找链表中的第一个空闲任务（状态0X0000的TCB节点），如果找不到，同样iret返回
+         ;4.如果找到了，就设置这个状态为0xffff
+         ;5.使用jmp指令切换到空闲任务(使用jmp指令则当前任务的TSS的B=0,新任务的B=1,任务之间是非嵌套的)
+         ;iretd中断返回
+
+         int3
          ;找当前任务（状态为忙的任务）在链表中的位置
          mov eax,tcb_chain                  
   .b0:                                      ;EAX=链表头或当前TCB线性地址
@@ -448,7 +481,7 @@ rtm_0x70_interrupt_handle:                  ;实时时钟中断处理过程
          je .b1
          mov eax,ebx                        ;定位到下一个TCB（的线性地址）
          jmp .b0         
-
+       int3
          ;将当前为忙的任务移到链尾
   .b1:
          mov ecx,[ebx]                      ;下游TCB的线性地址
@@ -473,15 +506,16 @@ rtm_0x70_interrupt_handle:                  ;实时时钟中断处理过程
          jz .irtn                           ;未发现空闲任务，从中断返回
          cmp word [eax+0x04],0x0000         ;是空闲任务？
          jnz .b4
-
+         int3
          ;将空闲任务和当前任务的状态都取反
          not word [eax+0x04]                ;设置空闲任务的状态为忙
          not word [ebx+0x04]                ;设置当前任务（忙）的状态为空闲
+         ;0x14的位置就是TSS选择子和偏移，这样就可以跳转到另一个任务了，进行任务的转移
          jmp far [eax+0x14]                 ;任务转换
 
   .irtn:
          popad
-
+       ;知道下一个时是时钟中断发生
          iretd
 
 ;-------------------------------------------------------------------------------
@@ -513,9 +547,12 @@ terminate_current_task:                     ;终止当前任务
          pidt             dw  0
                           dd  0
                           
-         ;任务控制块链
+         ;任务控制块链，指向第一个TCB的线性基地址，TCB中下一个TCB线性地址为0说明这个就是最后一个TCB任务
+         ;TCB的0x04偏移是任务的状态，值为0x0000的时候说明这个是空闲任务，0xffff说明这个正在运行中的任务（当前任务，忙任务）
+
          tcb_chain        dd  0 
 
+       ;内核TCB所需要的内存不是动态分配的，而是一段静态的空间，在内核程序编写的时候，就预先留出来了
          core_tcb   times  32  db 0         ;内核（程序管理器）的TCB
 
          page_bit_map     db  0xff,0xff,0xff,0xff,0xff,0xff,0x55,0x55
@@ -629,7 +666,11 @@ load_relocate_program:                      ;加载并重定位用户程序
          inc esi
          cmp esi,512
          jl .b1
-
+       
+       ;重新加载依次CR3，开启页功能的时候，页部件要把线性地址转化成物理地址，访问页目录和页表是要花费时间的
+       ;所有处理器专门有一个TLB（transformation Lookaside Buffer）
+       ;处理器只缓存哪些P=1的页表项，把cr3读出来重刑填写进去，TLB就无效（刷新）,所以在内存切换的时候TLB（也被刷新了）
+       
          mov eax,cr3
          mov cr3,eax                        ;刷新TLB 
          
@@ -844,7 +885,9 @@ load_relocate_program:                      ;加载并重定位用户程序
 ;-------------------------------------------------------------------------------
 append_to_tcb_link:                         ;在TCB链上追加任务控制块
                                             ;输入：ECX=TCB线性基地址
-         cli
+         ;为了避免在处理的时候中断出现，这个时候可能会崩溃
+         cli  ;禁止中断
+         
          
          push eax
          push ebx
@@ -874,13 +917,18 @@ start:
          ;在此之前，禁止调用put_string过程，以及任何含有sti指令的过程。
           
          ;前20个向量是处理器异常使用的
+         ;将中断归类，如硬件中断，异常，只需要两个通用的中断处理程序即可
+
          mov eax,general_exception_handler  ;门代码在段内偏移地址
          mov bx,flat_4gb_code_seg_sel       ;门代码所在段的选择子
          mov cx,0x8e00                      ;32位中断门，0特权级
-         call flat_4gb_code_seg_sel:make_gate_descriptor
 
+         call flat_4gb_code_seg_sel:make_gate_descriptor       ;这个程序只允许内核使用
+
+       ;设置IDT线性地址为0x8001f000
          mov ebx,idt_linear_address         ;中断描述符表的线性地址
          xor esi,esi
+         ;先安装前20个中断处理程序，每个程序8个字节（选择子（中断门，陷阱门，任务门，调用门）+段内偏移）都指向异常处理程序
   .idt0:
          mov [ebx+esi*8],eax
          mov [ebx+esi*8+4],edx
@@ -888,6 +936,8 @@ start:
          cmp esi,19                         ;安装前20个异常中断处理过程
          jle .idt0
 
+
+       ;安装中断处理程序,中断向量20-255对应这intel中保留的中断向量，以及外部硬件中断，使用通用的中断处理过程
          ;其余为保留或硬件使用的中断向量
          mov eax,general_interrupt_handler  ;门代码在段内偏移地址
          mov bx,flat_4gb_code_seg_sel       ;门代码所在段的选择子
@@ -902,6 +952,8 @@ start:
          cmp esi,255                        ;安装普通的中断处理过程
          jle .idt1
 
+
+
          ;设置实时时钟中断处理过程
          mov eax,rtm_0x70_interrupt_handle  ;门代码在段内偏移地址
          mov bx,flat_4gb_code_seg_sel       ;门代码所在段的选择子
@@ -912,18 +964,36 @@ start:
          mov [ebx+0x70*8],eax
          mov [ebx+0x70*8+4],edx
 
+       ;现在所有中断异常的门描述符已经安装好了，应该把中断描述符的基地址和界限值加载到IDTR中（应为OS只有一个IDT所有这个也是46bit而不是选择子）
+
          ;准备开放中断
          mov word [pidt],256*8-1            ;IDT的界限
          mov dword [pidt+2],idt_linear_address
          lidt [pidt]                        ;加载中断描述符表寄存器IDTR
 
-         ;设置8259A中断控制器
-         mov al,0x11
-         out 0x20,al                        ;ICW1：边沿触发/级联方式
-         mov al,0x20
+         ;重新初始化8259A芯片，其主片的中断限量和处理器的异常向量冲突0x08-0x0f(已经被处理器做异常向量了)
+         ;8529A一个芯片就分配两个端口，主片是0x20 and 0x21    从片是0xa0-0xa1
+         ;所以我们把主片的中断向量设置成0x20-0x27
+         ;设置8259A中断控制器需要使用初始化命令字ICW，来设置他的工作状态ICW1-ICW4都是单字命令
+         ;ICW1:设置中断请求的触发方式，级联的芯片数量
+         ;ICW2:设置每个芯片的中断向量
+         ;ICW3:指定哪个引脚来进行级联
+         ;ICW4：控制芯片的工作方式
+
+       ;设置ICW1
+         mov al,0x11                        
+         out 0x20,al                        ;ICW1：边沿触发/级联方式(需要ICW3)，有ICW4
+       
+       ;设置ICW2，设置一个起始值即可，高5位有效，设置完就是0x20-0x27
+         mov al,0x20 
          out 0x21,al                        ;ICW2:起始中断向量
+
+         ;设置ICW3，如果是主片，那么某个bit=1说明第几个引脚连接到从片
+         ;0x04=00000100,第3个引脚连接到从片
          mov al,0x04
          out 0x21,al                        ;ICW3:从片级联到IR2
+         
+         ;依然通过0x21来操作,非自动结束方式
          mov al,0x01
          out 0x21,al                        ;ICW4:非总线缓冲，全嵌套，正常EOI
 
@@ -931,15 +1001,20 @@ start:
          out 0xa0,al                        ;ICW1：边沿触发/级联方式
          mov al,0x70
          out 0xa1,al                        ;ICW2:起始中断向量
+         
+         ;0x00000100,ICW3只有s0-s2有效，表示从片连接到主片的哪个引脚，这个就是3号引脚
          mov al,0x04
          out 0xa1,al                        ;ICW3:从片级联到IR2
          mov al,0x01
          out 0xa1,al                        ;ICW4:非总线缓冲，全嵌套，正常EOI
 
-         ;设置和时钟中断相关的硬件 
+
+
+         ;设置0x70和时钟中断相关的硬件 
          mov al,0x0b                        ;RTC寄存器B
          or al,0x80                         ;阻断NMI
          out 0x70,al
+         
          mov al,0x12                        ;设置寄存器B，禁止周期性中断，开放更
          out 0x71,al                        ;新结束后中断，BCD码，24小时制
 
@@ -985,7 +1060,7 @@ start:
          mov ebx,cpu_brnd1
          call flat_4gb_code_seg_sel:put_string
 
-         ;以下开始安装为整个系统服务的调用门。特权级之间的控制转移必须使用门
+         ;以下开始安装为整个系统服务的调用门。特权级之间的控制转移必须使用门,安装调用门
          mov edi,salt                       ;C-SALT表的起始位置 
          mov ecx,salt_items                 ;C-SALT表的条目数量 
   .b4:
@@ -1007,14 +1082,17 @@ start:
          call far [salt_1+256]              ;通过门显示信息(偏移量将被忽略) 
 
          ;初始化创建程序管理器任务的任务控制块TCB
+         ;内核任务需要一个任务控制块，毕竟他也是需要进行任务轮转的
          mov word [core_tcb+0x04],0xffff    ;任务状态：忙碌
-         mov dword [core_tcb+0x06],0x80100000    
+         mov dword [core_tcb+0x06],0x80100000           ;因为从0x800000开始的1mb都被映射完了，所以下一个开始的就是那个值
+
                                             ;内核虚拟空间的分配从这里开始。
          mov word [core_tcb+0x0a],0xffff    ;登记LDT初始的界限到TCB中（未使用）
-         mov ecx,core_tcb
-         call append_to_tcb_link            ;将此TCB添加到TCB链中
+         mov ecx,core_tcb   
+         call append_to_tcb_link            ;将内核的TCB添加到TCB链中
 
          ;为程序管理器的TSS分配内存空间
+         ;创建内核任务的TSS，需要在内核的虚拟地址空间内分配内存空间
          alloc_core_linear                  ;宏：在内核的虚拟地址空间分配内存
 
          ;在程序管理器的TSS中设置必要的项目 
@@ -1052,7 +1130,7 @@ start:
          mov ecx,ebx         
          call append_to_tcb_link            ;将此TCB添加到TCB链中
 
-         ;创建用户任务的任务控制块
+         ;又创建用户任务的任务控制块
          alloc_core_linear                  ;宏：在内核的虚拟地址空间分配内存
 
          mov word [ebx+0x04],0              ;任务状态：空闲
@@ -1064,7 +1142,7 @@ start:
          call load_relocate_program
          mov ecx,ebx
          call append_to_tcb_link            ;将此TCB添加到TCB链中
-
+       ;这个时候任务切换也开始了，TCB链上只有一个忙的内核任务，0x70每秒产生
   .core:
          mov ebx,core_msg0
          call flat_4gb_code_seg_sel:put_string
